@@ -1,5 +1,7 @@
 import asyncio
 import collections
+import ctypes
+import ctypes.wintypes
 import sys
 import threading
 import time
@@ -29,6 +31,8 @@ TARGET_SERVICE_UUIDS = {
 }
 CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 TARGET_DEVICE_NAMES = {"M5_BLE_Mic", "M5_Mic_A"}
+RIGHT_ALT_TAP_PACKET = b"M5KRA"
+RIGHT_ALT_TAP_HOLD_SECONDS = 0.08
 stream = None
 packet_counter = 0
 warned_non_audio = False
@@ -61,6 +65,101 @@ last_drop_log_ts = 0.0
 # Incoming-rate measurement: detects firmware/input_sample_rate mismatch.
 rate_window_start = None
 rate_window_bytes = 0
+
+wintypes = ctypes.wintypes
+ULONG_PTR = wintypes.WPARAM
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = (
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    )
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = (
+        ("type", wintypes.DWORD),
+        ("union", INPUT_UNION),
+    )
+
+
+INPUT_KEYBOARD = 1
+VK_RMENU = 0xA5
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+
+
+def input_structure_size():
+    return ctypes.sizeof(INPUT)
+
+
+def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
+    """Send one Windows Right Alt key tap."""
+    if sys.platform != "win32":
+        print("⚠️ 收到按键触发，但当前系统不是 Windows，已跳过 Right Alt 模拟。")
+        return
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    key_down = (INPUT * 1)(
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(VK_RMENU, 0, KEYEVENTF_EXTENDEDKEY, 0, 0))),
+    )
+    key_up = (INPUT * 1)(
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(VK_RMENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0, 0))),
+    )
+
+    sent = user32.SendInput(len(key_down), key_down, ctypes.sizeof(INPUT))
+    if sent != len(key_down):
+        raise ctypes.WinError(ctypes.get_last_error())
+    time.sleep(hold_seconds)
+    sent = user32.SendInput(len(key_up), key_up, ctypes.sizeof(INPUT))
+    if sent != len(key_up):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+
+
+def start_right_alt_tap():
+    def worker():
+        try:
+            tap_right_alt()
+        except OSError as e:
+            print(f"⚠️ M5 按钮触发，但发送 Right Alt 失败: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     global resample_fractional_index, resample_last_sample
@@ -258,6 +357,14 @@ def notification_handler(sender, data):
     last_packet_ts = time.monotonic()
     if packet_counter <= 3:
         print(f"📥 收到通知包: idx={packet_counter}, len={len(data)}, sender={sender}")
+    if bytes(data) == RIGHT_ALT_TAP_PACKET:
+        try:
+            start_right_alt_tap()
+        except OSError as e:
+            print(f"⚠️ M5 按钮触发，但发送 Right Alt 失败: {e}")
+        else:
+            print("⌨️ M5 按钮触发：已排队发送 Right Alt 点击")
+        return
 
     # 4-byte payload is typically the counter from mic.ino BLE notify test, not PCM audio.
     if len(data) <= 4:
