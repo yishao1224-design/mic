@@ -1,5 +1,7 @@
 import asyncio
+import collections
 import sys
+import threading
 import time
 
 from bleak import BleakScanner, BleakClient
@@ -39,9 +41,26 @@ resample_last_sample = None
 last_read_probe_ts = 0.0
 audio_gain = 1.0
 
-# Conservative post-processing state (runs on 16k playback stream).
-lp_alpha = 0.35
-lp_prev_y = 0.0
+# Running DC estimate, updated smoothly across packets; subtracting each packet's
+# own mean stepped at every packet boundary and produced an audible buzz.
+dc_offset = 0.0
+
+# Bounded jitter buffer between the BLE callback and the sound card. The BLE
+# callback must never block: a blocking stream.write() there lets notifications
+# pile up invisibly in the WinRT/bleak queue, and playback delay grows to tens of
+# seconds. A dedicated writer thread drains this deque; when it holds more than
+# max_buffer_seconds of audio the oldest chunks are discarded, so end-to-end
+# latency stays bounded regardless of clock drift between the M5 and the PC.
+max_buffer_seconds = 0.3
+playback_buffer = collections.deque()
+playback_buffer_samples = 0
+playback_lock = threading.Lock()
+dropped_samples_total = 0
+last_drop_log_ts = 0.0
+
+# Incoming-rate measurement: detects firmware/input_sample_rate mismatch.
+rate_window_start = None
+rate_window_bytes = 0
 
 def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     global resample_fractional_index, resample_last_sample
@@ -74,23 +93,49 @@ def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     out = np.interp(np.asarray(positions, dtype=np.float32), x, src)
     return np.clip(out, -32768, 32767).astype(np.int16)
 
-def cleanup_voice_signal(samples):
-    global lp_prev_y
+def enqueue_playback(samples):
+    """Queue PCM for the writer thread. Never blocks the BLE callback.
 
-    if samples.size == 0:
-        return samples
+    When the buffer exceeds max_buffer_seconds the oldest audio is discarded:
+    stale sound is worthless in a live mic link, bounded latency is not.
+    """
+    global playback_buffer_samples, dropped_samples_total, last_drop_log_ts
 
-    x = samples.astype(np.float32)
-    out = np.empty_like(x)
+    limit = int(max_buffer_seconds * output_sample_rate)
+    dropped_now = 0
+    with playback_lock:
+        playback_buffer.append(samples)
+        playback_buffer_samples += samples.size
+        while playback_buffer_samples > limit and playback_buffer:
+            oldest = playback_buffer.popleft()
+            playback_buffer_samples -= oldest.size
+            dropped_samples_total += oldest.size
+            dropped_now += oldest.size
 
-    for i, s in enumerate(x):
-        # 1st-order low-pass only: keep voice natural and suppress sharp hiss.
-        lp = lp_prev_y + lp_alpha * (s - lp_prev_y)
-        lp_prev_y = lp
+    if dropped_now:
+        now = time.monotonic()
+        if now - last_drop_log_ts >= 2.0:
+            last_drop_log_ts = now
+            print(f"⏭️ 丢弃陈旧音频 {dropped_now * 1000 // output_sample_rate}ms 以保持低延迟 (累计 {dropped_samples_total * 1000 // output_sample_rate}ms)")
 
-        out[i] = lp
+def playback_writer_loop():
+    """Drains the jitter buffer into the sound card; blocking writes are fine here."""
+    global playback_buffer_samples
 
-    return np.clip(out, -32768.0, 32767.0).astype(np.int16)
+    while True:
+        chunk = None
+        with playback_lock:
+            if playback_buffer:
+                chunk = playback_buffer.popleft()
+                playback_buffer_samples -= chunk.size
+        if chunk is None:
+            time.sleep(0.005)
+            continue
+        try:
+            stream.write(chunk)
+        except Exception:
+            # Stream closed or device glitch; back off instead of spinning.
+            time.sleep(0.05)
 
 def play_local_test_tone(duration=0.25, samplerate=16000, freq=880.0, amp=0.18):
     t = np.arange(int(duration * samplerate), dtype=np.float32) / samplerate
@@ -204,7 +249,7 @@ async def prepare_windows_ble():
                 raise
 
 def notification_handler(sender, data):
-    global stream, packet_counter, warned_non_audio, first_packet_seen, last_packet_ts
+    global stream, packet_counter, warned_non_audio, first_packet_seen, last_packet_ts, dc_offset
     if not data:
         return
 
@@ -228,7 +273,7 @@ def notification_handler(sender, data):
             tone_len = 160
             t = np.arange(tone_len, dtype=np.float32) / output_sample_rate
             synth = (np.sin(2.0 * np.pi * freq * t) * 7000.0).astype(np.int16)
-            stream.write(synth)
+            enqueue_playback(synth)
 
         if packet_counter <= 10 or packet_counter % 50 == 0:
             print(f"📶 通知持续中（测试模式）: packets={packet_counter}, last_len={len(data)}")
@@ -246,22 +291,40 @@ def notification_handler(sender, data):
     # Parse mono PCM from firmware and apply light conditioning before resampling.
     mono_data = np.frombuffer(data, dtype=np.int16).astype(np.float32)
 
-    # Remove DC offset first, then apply neutral gain.
-    mono_data = mono_data - float(np.mean(mono_data))
+    # Update the running DC estimate slowly so packet boundaries stay continuous.
+    dc_offset += 0.05 * (float(np.mean(mono_data)) - dc_offset)
+    mono_data = mono_data - dc_offset
     mono_data = np.clip(mono_data * audio_gain, -32768.0, 32767.0).astype(np.int16)
 
     mono_data = resample_mono_int16(mono_data, in_rate=input_sample_rate, out_rate=output_sample_rate)
     if mono_data.size == 0:
         return
 
-    mono_data = cleanup_voice_signal(mono_data)
-    
-    max_volume = np.max(np.abs(mono_data))
-    if packet_counter <= 10 or packet_counter % 20 == 0:
+    if packet_counter <= 10:
+        max_volume = np.max(np.abs(mono_data))
         print(f"📡 蓝牙音频流传输中... 16k重采样后实时音量振幅: {max_volume}")
-    
-    # 写入 1 通道声卡，再也不会报 channel mismatch 错误
-    stream.write(mono_data)
+
+    # 进入有界抖动缓冲，由独立写线程送入声卡；回调本身绝不阻塞
+    enqueue_playback(mono_data)
+
+    # Measure the real incoming sample rate over 5 s windows; a mismatch with
+    # input_sample_rate means wrong pitch/speed and a growing or starving buffer.
+    global rate_window_start, rate_window_bytes
+    now = time.monotonic()
+    if rate_window_start is None:
+        rate_window_start = now
+    rate_window_bytes += len(data)
+    window = now - rate_window_start
+    if window >= 5.0:
+        measured_rate = (rate_window_bytes / 2.0) / window
+        with playback_lock:
+            buffered_ms = playback_buffer_samples * 1000.0 / output_sample_rate
+        dropped_ms = dropped_samples_total * 1000.0 / output_sample_rate
+        print(f"📊 输入采样率实测 ~{measured_rate:.0f} Hz (脚本假定 {input_sample_rate}), 播放缓冲 {buffered_ms:.0f}ms, 累计丢弃 {dropped_ms:.0f}ms")
+        if measured_rate > input_sample_rate * 1.1 or measured_rate < input_sample_rate * 0.9:
+            print(f"   ⚠️ 实测速率与假定不符：请把 input_sample_rate 改为 {measured_rate:.0f} 左右，音调/速度才正确。")
+        rate_window_start = now
+        rate_window_bytes = 0
 
 async def find_target_device(timeout=6.0):
     print(f"🔎 扫描附近 BLE 设备 {timeout:.0f}s，检查目标是否真的在发 BLE 广播...")
@@ -419,14 +482,16 @@ async def main():
                 break
 
         if device_index is not None:
-            stream = sd.OutputStream(samplerate=16000, channels=1, dtype='int16', device=device_index)
+            stream = sd.OutputStream(samplerate=16000, channels=1, dtype='int16', device=device_index, latency='low')
             stream.start()
             print("🚀 [SUCCESS] 1通道音频管道挂载成功！全部链路打通，请开始说话...")
         else:
             print("⚠️ 未找到 VB-Cable，自动回退到系统默认扬声器输出。")
-            stream = sd.OutputStream(samplerate=16000, channels=1, dtype='int16')
+            stream = sd.OutputStream(samplerate=16000, channels=1, dtype='int16', latency='low')
             stream.start()
             print("🚀 [SUCCESS] 已使用默认扬声器输出。")
+
+        threading.Thread(target=playback_writer_loop, daemon=True).start()
 
         try:
             play_local_test_tone()

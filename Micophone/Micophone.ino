@@ -9,11 +9,11 @@
 #define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 #define MIC_SAMPLE_RATE 8000
-#define READ_SAMPLES 120
+#define READ_SAMPLES 240  // 30 ms per packet; larger packets halve BLE notify overhead
 #define READ_LEN    (READ_SAMPLES * sizeof(int16_t))
 #define MIC_GAIN    3
 
-int16_t BUFFER[READ_SAMPLES] = {0};
+int16_t BUFFER[2][READ_SAMPLES] = {0};
 int16_t *micSamples = nullptr;
 uint32_t packetCounter = 0;
 uint32_t zeroPacketCounter = 0;
@@ -53,64 +53,79 @@ void drawWaveform() {
     }
 }
 
-// Use the official example's style of isolated mic task so audio capture is not blocked by BLE work.
+// Double-buffered capture: M5.Mic.record() is asynchronous (DMA fills the buffer in
+// the background), so one buffer records while the previous, completed one is streamed.
+// Streaming BUFFER right after record() returned was sending half-filled data.
 void mic_record_task(void *arg) {
+    int recIdx = 0;
+    while (!M5.Mic.record(BUFFER[recIdx], READ_SAMPLES, MIC_SAMPLE_RATE)) {
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
     while (1) {
-        if (M5.Mic.record(BUFFER, READ_SAMPLES, MIC_SAMPLE_RATE)) {
-            size_t bytesread = READ_LEN;
-            micSamples = (int16_t *)BUFFER;
-            drawWaveform();
-
-            // Diagnostic for the current problem: show whether the mic path is alive or stuck at silence.
-            int16_t *samples = (int16_t *)BUFFER;
-            int sampleCount = bytesread / 2;
-            int nonZeroCount = 0;
-            int32_t peak = 0;
-            int16_t firstSample = samples[0];
-            for (int i = 0; i < sampleCount; i++) {
-                int32_t v = abs(samples[i]);
-                if (v != 0) {
-                    nonZeroCount++;
-                }
-                if (v > peak) {
-                    peak = v;
-                }
-            }
-
-            if (peak == 0) {
-                zeroPacketCounter++;
-            } else {
-                zeroPacketCounter = 0;
-            }
-
-            if (packetCounter < 5 || packetCounter % 50 == 0) {
-                M5.Lcd.setCursor(0, 80);
-                M5.Lcd.fillRect(0, 80, 160, 20, BLACK);
-                M5.Lcd.printf("pkt:%lu nz:%d pk:%ld", (unsigned long)packetCounter, nonZeroCount, (long)peak);
-                Serial.printf("pkt:%lu nz:%d pk:%ld first:%d bytes:%u\n", (unsigned long)packetCounter, nonZeroCount, (long)peak, (int)firstSample, (unsigned int)bytesread);
-            }
-
-            // Keep BLE payload conservative (80 int16 = 160 bytes) to improve stability across adapters/MTU.
-            if (deviceConnected) {
-                pCharacteristic->setValue((uint8_t *)BUFFER, bytesread);
-                pCharacteristic->notify();
-
-                if (packetCounter < 5 || packetCounter % 100 == 0) {
-                    Serial.printf("notify sent: len=%u\n", (unsigned int)bytesread);
-                }
-            }
-
-            packetCounter++;
+        if (!M5.Mic.record(BUFFER[recIdx ^ 1], READ_SAMPLES, MIC_SAMPLE_RATE)) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
         }
+
+        // Wait until the older request has finished filling BUFFER[recIdx];
+        // isRecording() == 2 means it is still pending behind the newer request.
+        while (M5.Mic.isRecording() >= 2) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+        }
+
+        int16_t *samples = BUFFER[recIdx];
+        size_t bytesread = READ_LEN;
+        micSamples = samples;
+        if ((packetCounter & 3) == 0) {
+            drawWaveform();
+        }
+
+        // Diagnostic for the current problem: show whether the mic path is alive or stuck at silence.
+        int sampleCount = bytesread / 2;
+        int nonZeroCount = 0;
+        int32_t peak = 0;
+        int16_t firstSample = samples[0];
+        for (int i = 0; i < sampleCount; i++) {
+            int32_t v = abs(samples[i]);
+            if (v != 0) {
+                nonZeroCount++;
+            }
+            if (v > peak) {
+                peak = v;
+            }
+        }
+
+        if (peak == 0) {
+            zeroPacketCounter++;
+        } else {
+            zeroPacketCounter = 0;
+        }
+
+        if (packetCounter < 5 || packetCounter % 50 == 0) {
+            M5.Lcd.setCursor(0, 80);
+            M5.Lcd.fillRect(0, 80, 160, 20, BLACK);
+            M5.Lcd.printf("pkt:%lu nz:%d pk:%ld", (unsigned long)packetCounter, nonZeroCount, (long)peak);
+            Serial.printf("pkt:%lu nz:%d pk:%ld first:%d bytes:%u\n", (unsigned long)packetCounter, nonZeroCount, (long)peak, (int)firstSample, (unsigned int)bytesread);
+        }
+
+        if (deviceConnected) {
+            pCharacteristic->setValue((uint8_t *)samples, bytesread);
+            pCharacteristic->notify();
+
+            if (packetCounter < 5 || packetCounter % 100 == 0) {
+                Serial.printf("notify sent: len=%u\n", (unsigned int)bytesread);
+            }
+        }
+
+        packetCounter++;
+        recIdx ^= 1;
 
         if (zeroPacketCounter == 50) {
             M5.Lcd.setCursor(0, 90);
             M5.Lcd.fillRect(0, 90, 160, 12, BLACK);
             M5.Lcd.print("Mic silence/check wiring");
         }
-
-        // Keep loop responsive without inserting large gaps between audio chunks.
-        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
@@ -134,6 +149,7 @@ void setup() {
 
     // 2. 乐鑫官方标准低功耗蓝牙初始化
     BLEDevice::init("M5_BLE_Mic"); // 名字对齐你的 TARGET_DEVICE_NAMES
+    BLEDevice::setMTU(517); // 允许 480 字节音频负载放进单个 notify，避免被截断
     BLEServer *pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
