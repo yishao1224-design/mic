@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 
-#define READ_SAMPLES 1024
+#define MIC_SAMPLE_RATE 8000
+#define READ_SAMPLES 120
 #define READ_LEN    (READ_SAMPLES * sizeof(int16_t))
 #define GAIN_FACTOR 3
 int16_t BUFFER[READ_SAMPLES] = {0};
@@ -21,11 +22,11 @@ void showSignal() {
 
 void mic_record_task(void *arg) {
     while (1) {
-        if (M5.Mic.record(BUFFER, READ_SAMPLES, 16000)) {
+        if (M5.Mic.record(BUFFER, READ_SAMPLES, MIC_SAMPLE_RATE)) {
             adcBuffer = BUFFER;
             showSignal();
         }
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 

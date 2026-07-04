@@ -8,7 +8,8 @@
 #define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-#define READ_SAMPLES 1024
+#define MIC_SAMPLE_RATE 8000
+#define READ_SAMPLES 120
 #define READ_LEN    (READ_SAMPLES * sizeof(int16_t))
 #define MIC_GAIN    3
 
@@ -16,6 +17,8 @@ int16_t BUFFER[READ_SAMPLES] = {0};
 int16_t *micSamples = nullptr;
 uint32_t packetCounter = 0;
 uint32_t zeroPacketCounter = 0;
+volatile bool uiConnectedChanged = false;
+volatile bool uiIsConnected = false;
 
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
@@ -24,15 +27,13 @@ bool deviceConnected = false;
 class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) { 
         deviceConnected = true; 
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 10);
-        M5.Lcd.println("BLE Connected!");
+        uiIsConnected = true;
+        uiConnectedChanged = true;
     };
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 10);
-        M5.Lcd.println("BLE Disconnected\nAdvertising...");
+        uiIsConnected = false;
+        uiConnectedChanged = true;
         BLEDevice::startAdvertising(); // 断开后自动重新广播
     }
 };
@@ -55,7 +56,7 @@ void drawWaveform() {
 // Use the official example's style of isolated mic task so audio capture is not blocked by BLE work.
 void mic_record_task(void *arg) {
     while (1) {
-        if (M5.Mic.record(BUFFER, READ_SAMPLES, 16000)) {
+        if (M5.Mic.record(BUFFER, READ_SAMPLES, MIC_SAMPLE_RATE)) {
             size_t bytesread = READ_LEN;
             micSamples = (int16_t *)BUFFER;
             drawWaveform();
@@ -89,10 +90,14 @@ void mic_record_task(void *arg) {
                 Serial.printf("pkt:%lu nz:%d pk:%ld first:%d bytes:%u\n", (unsigned long)packetCounter, nonZeroCount, (long)peak, (int)firstSample, (unsigned int)bytesread);
             }
 
-            // Keep BLE payload compatible with the Python side.
+            // Keep BLE payload conservative (80 int16 = 160 bytes) to improve stability across adapters/MTU.
             if (deviceConnected) {
                 pCharacteristic->setValue((uint8_t *)BUFFER, bytesread);
                 pCharacteristic->notify();
+
+                if (packetCounter < 5 || packetCounter % 100 == 0) {
+                    Serial.printf("notify sent: len=%u\n", (unsigned int)bytesread);
+                }
             }
 
             packetCounter++;
@@ -104,7 +109,8 @@ void mic_record_task(void *arg) {
             M5.Lcd.print("Mic silence/check wiring");
         }
 
-        vTaskDelay(5 / portTICK_PERIOD_MS);
+        // Keep loop responsive without inserting large gaps between audio chunks.
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 }
 
@@ -118,10 +124,13 @@ void setup() {
     M5.Lcd.println("AI MIC Booting...");
 
     M5.Speaker.end();
-    M5.Mic.begin();
+    bool micOk = M5.Mic.begin();
     M5.Lcd.setCursor(0, 20);
     M5.Lcd.fillRect(0, 20, 160, 18, BLACK);
-    M5.Lcd.print("mic:M5.Mic.begin");
+    M5.Lcd.print(micOk ? "mic:init ok" : "mic:init fail");
+    if (!micOk) {
+        Serial.println("Mic init failed, skip capture task to avoid reboot loop.");
+    }
 
     // 2. 乐鑫官方标准低功耗蓝牙初始化
     BLEDevice::init("M5_BLE_Mic"); // 名字对齐你的 TARGET_DEVICE_NAMES
@@ -148,10 +157,22 @@ void setup() {
 
     M5.Lcd.println("BLE Ready!\nSearch: M5_BLE_Mic");
 
-    xTaskCreatePinnedToCore(mic_record_task, "mic_record_task", 4096, NULL, 1, NULL, 1);
+    if (micOk) {
+        xTaskCreatePinnedToCore(mic_record_task, "mic_record_task", 8192, NULL, 1, NULL, 1);
+    }
 }
 
 void loop() {
     M5.update(); // 保持核心按键和电源管理状态刷新
+    if (uiConnectedChanged) {
+        uiConnectedChanged = false;
+        M5.Lcd.setCursor(0, 10);
+        M5.Lcd.fillRect(0, 10, 160, 20, BLACK);
+        if (uiIsConnected) {
+            M5.Lcd.println("BLE Connected!");
+        } else {
+            M5.Lcd.println("BLE Disconnected");
+        }
+    }
     delay(100);
 }

@@ -32,10 +32,16 @@ packet_counter = 0
 warned_non_audio = False
 first_packet_seen = False
 last_packet_ts = 0.0
-input_sample_rate = 44100
+input_sample_rate = 8000
 output_sample_rate = 16000
 resample_fractional_index = 0.0
 resample_last_sample = None
+last_read_probe_ts = 0.0
+audio_gain = 1.0
+
+# Conservative post-processing state (runs on 16k playback stream).
+lp_alpha = 0.35
+lp_prev_y = 0.0
 
 def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     global resample_fractional_index, resample_last_sample
@@ -67,6 +73,24 @@ def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     x = np.arange(src.size, dtype=np.float32)
     out = np.interp(np.asarray(positions, dtype=np.float32), x, src)
     return np.clip(out, -32768, 32767).astype(np.int16)
+
+def cleanup_voice_signal(samples):
+    global lp_prev_y
+
+    if samples.size == 0:
+        return samples
+
+    x = samples.astype(np.float32)
+    out = np.empty_like(x)
+
+    for i, s in enumerate(x):
+        # 1st-order low-pass only: keep voice natural and suppress sharp hiss.
+        lp = lp_prev_y + lp_alpha * (s - lp_prev_y)
+        lp_prev_y = lp
+
+        out[i] = lp
+
+    return np.clip(out, -32768.0, 32767.0).astype(np.int16)
 
 def play_local_test_tone(duration=0.25, samplerate=16000, freq=880.0, amp=0.18):
     t = np.arange(int(duration * samplerate), dtype=np.float32) / samplerate
@@ -115,11 +139,29 @@ async def connect_with_progress(client, timeout=12.0):
     task = asyncio.create_task(client.connect())
     started = time.monotonic()
     connected_seen = False
+    connected_since = None
     while True:
         # Some WinRT stacks report connected state before connect() coroutine returns.
         if client.is_connected and not connected_seen:
             connected_seen = True
+            connected_since = time.monotonic()
             print("   ...检测到系统已连接，等待底层初始化完成...")
+
+        # On some Windows/Bleak combinations, connect() may hang despite an established link.
+        # If connected state is stable for several seconds, proceed optimistically.
+        if connected_seen and connected_since is not None:
+            stable_secs = time.monotonic() - connected_since
+            if stable_secs >= 6.0:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                print("   ...连接状态已稳定，跳过等待 connect() 返回，继续 GATT 发现...")
+                return True
 
         done, _ = await asyncio.wait({task}, timeout=1.0)
         if task in done:
@@ -130,7 +172,16 @@ async def connect_with_progress(client, timeout=12.0):
         print(f"   ...连接中 {elapsed:.0f}s/{timeout:.0f}s")
         if elapsed >= timeout:
             if client.is_connected:
-                print("   ...链路已连，但仍在等待 GATT 初始化完成...")
+                print("   ...链路已连，按已连接继续，后续由 GATT 步骤验证...")
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
+                return True
             task.cancel()
             raise TimeoutError("BLE connect timeout")
 
@@ -192,15 +243,22 @@ def notification_handler(sender, data):
     if len(data) % 2 != 0:
         return
     
-    # Parse 44.1kHz mono PCM from the firmware and resample it to 16kHz for playback.
-    mono_data = np.frombuffer(data, dtype=np.int16).copy()
-    mono_data = np.clip(mono_data * 8, -32768, 32767).astype(np.int16)
+    # Parse mono PCM from firmware and apply light conditioning before resampling.
+    mono_data = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+
+    # Remove DC offset first, then apply neutral gain.
+    mono_data = mono_data - float(np.mean(mono_data))
+    mono_data = np.clip(mono_data * audio_gain, -32768.0, 32767.0).astype(np.int16)
+
     mono_data = resample_mono_int16(mono_data, in_rate=input_sample_rate, out_rate=output_sample_rate)
     if mono_data.size == 0:
         return
+
+    mono_data = cleanup_voice_signal(mono_data)
     
     max_volume = np.max(np.abs(mono_data))
-    print(f"📡 蓝牙音频流传输中... 16k重采样后实时音量振幅: {max_volume}")
+    if packet_counter <= 10 or packet_counter % 20 == 0:
+        print(f"📡 蓝牙音频流传输中... 16k重采样后实时音量振幅: {max_volume}")
     
     # 写入 1 通道声卡，再也不会报 channel mismatch 错误
     stream.write(mono_data)
@@ -243,7 +301,7 @@ async def find_target_device(timeout=6.0):
     return None
 
 async def main():
-    global stream, first_packet_seen, packet_counter, last_packet_ts
+    global stream, first_packet_seen, packet_counter, last_packet_ts, last_read_probe_ts
     
     print("🔍 [1/2] 绕过声卡独占，开始利用 Service UUID 直接轰炸 M5...")
     await prepare_windows_ble()
@@ -376,19 +434,70 @@ async def main():
             print(f"⚠️ 本地音频自检失败: {e}")
 
         no_packet_wait_secs = 0
+        notify_resubscribe_count = 0
+        stalled_resubscribe_count = 0
+        last_stall_recover_ts = 0.0
+        stall_warning_latched = False
         while True:
-            if first_packet_seen and (time.monotonic() - last_packet_ts) > 5.0:
-                print("⚠️ 超过 5 秒未收到新通知包，设备可能暂停推流或已掉线。")
-                # Avoid spamming this warning every loop.
-                last_packet_ts = time.monotonic()
+            if first_packet_seen:
+                since_last = time.monotonic() - last_packet_ts
+                if since_last > 5.0 and not stall_warning_latched:
+                    stall_warning_latched = True
+                    print("⚠️ 超过 5 秒未收到新通知包，设备可能暂停推流或已掉线。")
+                if since_last <= 2.0:
+                    stall_warning_latched = False
+
+                if since_last >= 10.0 and (time.monotonic() - last_stall_recover_ts) >= 8.0:
+                    last_stall_recover_ts = time.monotonic()
+                    try:
+                        await client.stop_notify(selected_char)
+                        await asyncio.sleep(0.2)
+                        await client.start_notify(selected_char, notification_handler)
+                        stalled_resubscribe_count += 1
+                        print(f"🔁 检测到断流，已重置 notify (断流恢复第 {stalled_resubscribe_count} 次)")
+                    except Exception as e:
+                        print(f"⚠️ 断流重置 notify 失败: {e}")
+
+                    try:
+                        polled = await client.read_gatt_char(selected_char)
+                        if polled:
+                            print(f"📤 断流恢复读取到特征值 len={len(polled)}")
+                            notification_handler(selected_char, polled)
+                        else:
+                            print("📭 断流恢复读取为空")
+                    except Exception as e:
+                        print(f"⚠️ 断流恢复主动读取失败: {e}")
+
             if not first_packet_seen:
                 no_packet_wait_secs += 1
                 if no_packet_wait_secs % 5 == 0:
                     print(f"⏳ 等待 BLE 数据包中... ({no_packet_wait_secs}s, 已连接但尚未收到通知)")
                 if no_packet_wait_secs == 10:
                     print("💡 10秒无通知：请确认 M5 当前固件在 loop() 中持续调用 notify。")
+                if no_packet_wait_secs in (20, 40) and notify_resubscribe_count < 2:
+                    try:
+                        await client.stop_notify(selected_char)
+                        await asyncio.sleep(0.2)
+                        await client.start_notify(selected_char, notification_handler)
+                        notify_resubscribe_count += 1
+                        print(f"🔁 已重置 notify 订阅 (第 {notify_resubscribe_count} 次)")
+                    except Exception as e:
+                        print(f"⚠️ 重置 notify 失败: {e}")
                 if no_packet_wait_secs == 30:
-                    print("💡 30秒无通知：Python 侧已连通，问题几乎肯定在设备端未发送数据。")
+                    print("💡 30秒无通知：Python 侧已连通；优先怀疑设备端未发送或 notify 未真正开启。")
+
+                now = time.monotonic()
+                if now - last_read_probe_ts >= 10.0:
+                    last_read_probe_ts = now
+                    try:
+                        polled = await client.read_gatt_char(selected_char)
+                        if polled:
+                            print(f"📤 主动读取到特征值 len={len(polled)}，将按音频包路径处理。")
+                            notification_handler(selected_char, polled)
+                        else:
+                            print("📭 主动读取返回空值。")
+                    except Exception as e:
+                        print(f"⚠️ 主动读取特征值失败: {e}")
             await asyncio.sleep(1)
 
     except TimeoutError as e:
