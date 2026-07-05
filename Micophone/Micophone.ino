@@ -20,7 +20,9 @@ uint32_t zeroPacketCounter = 0;
 volatile bool uiConnectedChanged = false;
 volatile bool uiIsConnected = false;
 volatile bool rightAltTapPending = false;
+volatile bool enterTapPending = false;
 static const uint8_t RIGHT_ALT_TAP_PACKET[] = {'M', '5', 'K', 'R', 'A'};
+static const uint8_t ENTER_TAP_PACKET[] = {'M', '5', 'K', 'E', 'N'};
 
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
@@ -37,6 +39,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
         uiIsConnected = false;
         uiConnectedChanged = true;
         rightAltTapPending = false;
+        enterTapPending = false;
         BLEDevice::startAdvertising(); // 断开后自动重新广播
     }
 };
@@ -102,6 +105,7 @@ void drawWaveform() {
 void sendControlNotifications() {
     if (!deviceConnected) {
         rightAltTapPending = false;
+        enterTapPending = false;
         return;
     }
 
@@ -110,6 +114,13 @@ void sendControlNotifications() {
         pCharacteristic->setValue((uint8_t *)RIGHT_ALT_TAP_PACKET, sizeof(RIGHT_ALT_TAP_PACKET));
         pCharacteristic->notify();
         Serial.println("button click: Right Alt tap marker sent");
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+    if (enterTapPending) {
+        enterTapPending = false;
+        pCharacteristic->setValue((uint8_t *)ENTER_TAP_PACKET, sizeof(ENTER_TAP_PACKET));
+        pCharacteristic->notify();
+        Serial.println("button hold: Enter tap marker sent");
         vTaskDelay(5 / portTICK_PERIOD_MS);
     }
 }
@@ -188,6 +199,7 @@ void mic_record_task(void *arg) {
             }
         } else {
             rightAltTapPending = false;
+            enterTapPending = false;
         }
 
         packetCounter++;
@@ -255,7 +267,10 @@ void setup() {
 
 void loop() {
     M5.update(); // 保持核心按键和电源管理状态刷新
-    if (M5.BtnA.wasClicked()) {
+    if (M5.BtnA.wasHold()) {
+        enterTapPending = deviceConnected;
+        Serial.println(deviceConnected ? "button hold: Enter tap queued" : "button hold ignored: BLE disconnected");
+    } else if (M5.BtnA.wasClicked()) {
         rightAltTapPending = deviceConnected;
         Serial.println(deviceConnected ? "button click: Right Alt tap queued" : "button click ignored: BLE disconnected");
     }

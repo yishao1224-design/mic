@@ -59,6 +59,16 @@ class ButtonControlTests(unittest.TestCase):
         self.assertEqual(calls, ["tap"])
         self.assertEqual(self.main.packet_counter, 1)
 
+    def test_enter_marker_taps_enter_once(self):
+        calls = []
+        self.main.start_enter_tap = lambda: calls.append("enter")
+
+        with redirect_stdout(io.StringIO()):
+            self.main.notification_handler("char", self.main.ENTER_TAP_PACKET)
+
+        self.assertEqual(calls, ["enter"])
+        self.assertEqual(self.main.packet_counter, 1)
+
     def test_button_marker_does_not_raise_when_key_tap_fails(self):
         def fail_tap():
             raise OSError(87, "invalid parameter")
@@ -84,6 +94,18 @@ class ButtonControlTests(unittest.TestCase):
         self.assertEqual(queued, [])
         self.assertFalse(self.main.warned_non_audio)
 
+    def test_enter_marker_is_not_queued_as_audio_or_test_tone(self):
+        taps = []
+        queued = []
+        self.main.start_enter_tap = lambda: taps.append("enter")
+        self.main.enqueue_playback = lambda samples: queued.append(samples)
+
+        with redirect_stdout(io.StringIO()):
+            self.main.notification_handler("char", self.main.ENTER_TAP_PACKET)
+
+        self.assertEqual(taps, ["enter"])
+        self.assertEqual(queued, [])
+        self.assertFalse(self.main.warned_non_audio)
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,14 @@ class FirmwareContractTests(unittest.TestCase):
         self.assertIn("rightAltTapPending = deviceConnected;", source)
         self.assertNotIn("recordingEnabled = !recordingEnabled", source)
 
+    def test_button_hold_queues_enter_marker(self):
+        source = FIRMWARE.read_text(encoding="utf-8")
+
+        self.assertIn("ENTER_TAP_PACKET", source)
+        self.assertIn("enterTapPending", source)
+        self.assertIn("if (M5.BtnA.wasHold())", source)
+        self.assertIn("enterTapPending = deviceConnected;", source)
+
 
 if __name__ == "__main__":
     unittest.main()

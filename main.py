@@ -32,7 +32,10 @@ TARGET_SERVICE_UUIDS = {
 CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 TARGET_DEVICE_NAMES = {"M5_BLE_Mic", "M5_Mic_A"}
 RIGHT_ALT_TAP_PACKET = b"M5KRA"
-RIGHT_ALT_TAP_HOLD_SECONDS = 0.08
+ENTER_TAP_PACKET = b"M5KEN"
+KEY_TAP_HOLD_SECONDS = 0.08
+RIGHT_ALT_TAP_HOLD_SECONDS = KEY_TAP_HOLD_SECONDS
+ENTER_TAP_HOLD_SECONDS = KEY_TAP_HOLD_SECONDS
 stream = None
 packet_counter = 0
 warned_non_audio = False
@@ -116,6 +119,7 @@ class INPUT(ctypes.Structure):
 
 INPUT_KEYBOARD = 1
 VK_RMENU = 0xA5
+VK_RETURN = 0x0D
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 
@@ -124,10 +128,10 @@ def input_structure_size():
     return ctypes.sizeof(INPUT)
 
 
-def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
-    """Send one Windows Right Alt key tap."""
+def tap_windows_key(vk_code, key_flags=0, hold_seconds=KEY_TAP_HOLD_SECONDS):
+    """Send one Windows virtual-key tap."""
     if sys.platform != "win32":
-        print("⚠️ 收到按键触发，但当前系统不是 Windows，已跳过 Right Alt 模拟。")
+        print("Key tap requested, but this system is not Windows; skipped.")
         return
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -135,10 +139,10 @@ def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
     user32.SendInput.restype = wintypes.UINT
 
     key_down = (INPUT * 1)(
-        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(VK_RMENU, 0, KEYEVENTF_EXTENDEDKEY, 0, 0))),
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(vk_code, 0, key_flags, 0, 0))),
     )
     key_up = (INPUT * 1)(
-        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(VK_RMENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0, 0))),
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(vk_code, 0, key_flags | KEYEVENTF_KEYUP, 0, 0))),
     )
 
     sent = user32.SendInput(len(key_down), key_down, ctypes.sizeof(INPUT))
@@ -150,6 +154,14 @@ def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
+    """Send one Windows Right Alt key tap."""
+    tap_windows_key(VK_RMENU, KEYEVENTF_EXTENDEDKEY, hold_seconds)
+
+
+def tap_enter(hold_seconds=ENTER_TAP_HOLD_SECONDS):
+    """Send one Windows Enter key tap."""
+    tap_windows_key(VK_RETURN, 0, hold_seconds)
 
 
 def start_right_alt_tap():
@@ -157,7 +169,17 @@ def start_right_alt_tap():
         try:
             tap_right_alt()
         except OSError as e:
-            print(f"⚠️ M5 按钮触发，但发送 Right Alt 失败: {e}")
+            print(f"M5 button trigger failed to send Right Alt: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def start_enter_tap():
+    def worker():
+        try:
+            tap_enter()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Enter: {e}")
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -357,13 +379,22 @@ def notification_handler(sender, data):
     last_packet_ts = time.monotonic()
     if packet_counter <= 3:
         print(f"📥 收到通知包: idx={packet_counter}, len={len(data)}, sender={sender}")
-    if bytes(data) == RIGHT_ALT_TAP_PACKET:
+    payload = bytes(data)
+    if payload == RIGHT_ALT_TAP_PACKET:
         try:
             start_right_alt_tap()
         except OSError as e:
-            print(f"⚠️ M5 按钮触发，但发送 Right Alt 失败: {e}")
+            print(f"M5 button trigger failed to send Right Alt: {e}")
         else:
-            print("⌨️ M5 按钮触发：已排队发送 Right Alt 点击")
+            print("M5 button trigger: queued Right Alt tap")
+        return
+    if payload == ENTER_TAP_PACKET:
+        try:
+            start_enter_tap()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Enter: {e}")
+        else:
+            print("M5 button trigger: queued Enter tap")
         return
 
     # 4-byte payload is typically the counter from mic.ino BLE notify test, not PCM audio.
