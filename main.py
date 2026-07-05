@@ -1,5 +1,7 @@
 import asyncio
 import collections
+import ctypes
+import ctypes.wintypes
 import sys
 import threading
 import time
@@ -29,6 +31,11 @@ TARGET_SERVICE_UUIDS = {
 }
 CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 TARGET_DEVICE_NAMES = {"M5_BLE_Mic", "M5_Mic_A"}
+RIGHT_ALT_TAP_PACKET = b"M5KRA"
+ENTER_TAP_PACKET = b"M5KEN"
+KEY_TAP_HOLD_SECONDS = 0.08
+RIGHT_ALT_TAP_HOLD_SECONDS = KEY_TAP_HOLD_SECONDS
+ENTER_TAP_HOLD_SECONDS = KEY_TAP_HOLD_SECONDS
 stream = None
 packet_counter = 0
 warned_non_audio = False
@@ -61,6 +68,120 @@ last_drop_log_ts = 0.0
 # Incoming-rate measurement: detects firmware/input_sample_rate mismatch.
 rate_window_start = None
 rate_window_bytes = 0
+
+wintypes = ctypes.wintypes
+ULONG_PTR = wintypes.WPARAM
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class INPUT_UNION(ctypes.Union):
+    _fields_ = (
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT),
+    )
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = (
+        ("type", wintypes.DWORD),
+        ("union", INPUT_UNION),
+    )
+
+
+INPUT_KEYBOARD = 1
+VK_RMENU = 0xA5
+VK_RETURN = 0x0D
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+
+
+def input_structure_size():
+    return ctypes.sizeof(INPUT)
+
+
+def tap_windows_key(vk_code, key_flags=0, hold_seconds=KEY_TAP_HOLD_SECONDS):
+    """Send one Windows virtual-key tap."""
+    if sys.platform != "win32":
+        print("Key tap requested, but this system is not Windows; skipped.")
+        return
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    key_down = (INPUT * 1)(
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(vk_code, 0, key_flags, 0, 0))),
+    )
+    key_up = (INPUT * 1)(
+        INPUT(INPUT_KEYBOARD, INPUT_UNION(ki=KEYBDINPUT(vk_code, 0, key_flags | KEYEVENTF_KEYUP, 0, 0))),
+    )
+
+    sent = user32.SendInput(len(key_down), key_down, ctypes.sizeof(INPUT))
+    if sent != len(key_down):
+        raise ctypes.WinError(ctypes.get_last_error())
+    time.sleep(hold_seconds)
+    sent = user32.SendInput(len(key_up), key_up, ctypes.sizeof(INPUT))
+    if sent != len(key_up):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def tap_right_alt(hold_seconds=RIGHT_ALT_TAP_HOLD_SECONDS):
+    """Send one Windows Right Alt key tap."""
+    tap_windows_key(VK_RMENU, KEYEVENTF_EXTENDEDKEY, hold_seconds)
+
+
+def tap_enter(hold_seconds=ENTER_TAP_HOLD_SECONDS):
+    """Send one Windows Enter key tap."""
+    tap_windows_key(VK_RETURN, 0, hold_seconds)
+
+
+def start_right_alt_tap():
+    def worker():
+        try:
+            tap_right_alt()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Right Alt: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def start_enter_tap():
+    def worker():
+        try:
+            tap_enter()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Enter: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def resample_mono_int16(samples, in_rate=44100, out_rate=16000):
     global resample_fractional_index, resample_last_sample
@@ -258,6 +379,23 @@ def notification_handler(sender, data):
     last_packet_ts = time.monotonic()
     if packet_counter <= 3:
         print(f"📥 收到通知包: idx={packet_counter}, len={len(data)}, sender={sender}")
+    payload = bytes(data)
+    if payload == RIGHT_ALT_TAP_PACKET:
+        try:
+            start_right_alt_tap()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Right Alt: {e}")
+        else:
+            print("M5 button trigger: queued Right Alt tap")
+        return
+    if payload == ENTER_TAP_PACKET:
+        try:
+            start_enter_tap()
+        except OSError as e:
+            print(f"M5 button trigger failed to send Enter: {e}")
+        else:
+            print("M5 button trigger: queued Enter tap")
+        return
 
     # 4-byte payload is typically the counter from mic.ino BLE notify test, not PCM audio.
     if len(data) <= 4:

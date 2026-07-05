@@ -19,6 +19,10 @@ uint32_t packetCounter = 0;
 uint32_t zeroPacketCounter = 0;
 volatile bool uiConnectedChanged = false;
 volatile bool uiIsConnected = false;
+volatile bool rightAltTapPending = false;
+volatile bool enterTapPending = false;
+static const uint8_t RIGHT_ALT_TAP_PACKET[] = {'M', '5', 'K', 'R', 'A'};
+static const uint8_t ENTER_TAP_PACKET[] = {'M', '5', 'K', 'E', 'N'};
 
 BLECharacteristic *pCharacteristic;
 bool deviceConnected = false;
@@ -34,43 +38,116 @@ class MyServerCallbacks: public BLEServerCallbacks {
         deviceConnected = false;
         uiIsConnected = false;
         uiConnectedChanged = true;
+        rightAltTapPending = false;
+        enterTapPending = false;
         BLEDevice::startAdvertising(); // 断开后自动重新广播
     }
 };
 
+// Screen layout (240x135 in rotation 3): two 10px text rows on top, waveform below.
+#define STATUS_ROW_Y   1
+#define DIAG_ROW_Y     11
+#define WAVE_TOP       22
+
+bool micTaskRunning = false;
+
+void drawStatusBar() {
+    M5.Lcd.fillRect(0, 0, M5.Lcd.width(), 10, BLACK);
+    M5.Lcd.setCursor(0, STATUS_ROW_Y);
+    if (uiIsConnected) {
+        M5.Lcd.setTextColor(GREEN, BLACK);
+        M5.Lcd.print("BLE Connected");
+    } else {
+        M5.Lcd.setTextColor(YELLOW, BLACK);
+        M5.Lcd.print("Advertising: M5_BLE_Mic");
+    }
+    M5.Lcd.setTextColor(WHITE, BLACK);
+}
+
+// Full-screen oscilloscope trace: erase the previous polyline in the background
+// color (the old code erased with WHITE on a BLACK screen, littering the display),
+// redraw the center reference line, then draw the new polyline.
 void drawWaveform() {
     if (micSamples == nullptr) {
         return;
     }
 
-    static uint16_t oldy[160] = {0};
-    for (int n = 0; n < 128 && n < 160; n++) {
-        int y = micSamples[n] * MIC_GAIN;
-        y = map(y, INT16_MIN, INT16_MAX, 10, 70);
-        M5.Lcd.drawPixel(n, oldy[n], WHITE);
-        M5.Lcd.drawPixel(n, y, BLACK);
-        oldy[n] = y;
+    const int w = M5.Lcd.width();
+    const int bottom = M5.Lcd.height() - 1;
+    const int mid = (WAVE_TOP + bottom) / 2;
+    const int halfH = (bottom - WAVE_TOP) / 2;
+
+    static int16_t oldy[320];
+    static bool hasOld = false;
+
+    if (hasOld) {
+        for (int x = 1; x < w; x++) {
+            M5.Lcd.drawLine(x - 1, oldy[x - 1], x, oldy[x], BLACK);
+        }
     }
+    M5.Lcd.drawFastHLine(0, mid, w, DARKGREY);
+
+    for (int x = 0; x < w; x++) {
+        int32_t v = (int32_t)micSamples[(x * READ_SAMPLES) / w] * MIC_GAIN;
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        oldy[x] = mid - (int)((v * halfH) / 32768);
+    }
+    for (int x = 1; x < w; x++) {
+        M5.Lcd.drawLine(x - 1, oldy[x - 1], x, oldy[x], GREEN);
+    }
+    hasOld = true;
 }
 
 // Double-buffered capture: M5.Mic.record() is asynchronous (DMA fills the buffer in
 // the background), so one buffer records while the previous, completed one is streamed.
 // Streaming BUFFER right after record() returned was sending half-filled data.
+void sendControlNotifications() {
+    if (!deviceConnected) {
+        rightAltTapPending = false;
+        enterTapPending = false;
+        return;
+    }
+
+    if (rightAltTapPending) {
+        rightAltTapPending = false;
+        pCharacteristic->setValue((uint8_t *)RIGHT_ALT_TAP_PACKET, sizeof(RIGHT_ALT_TAP_PACKET));
+        pCharacteristic->notify();
+        Serial.println("button click: Right Alt tap marker sent");
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+    if (enterTapPending) {
+        enterTapPending = false;
+        pCharacteristic->setValue((uint8_t *)ENTER_TAP_PACKET, sizeof(ENTER_TAP_PACKET));
+        pCharacteristic->notify();
+        Serial.println("button hold: Enter tap marker sent");
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+}
+
+
 void mic_record_task(void *arg) {
     int recIdx = 0;
     while (!M5.Mic.record(BUFFER[recIdx], READ_SAMPLES, MIC_SAMPLE_RATE)) {
+        sendControlNotifications();
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
     while (1) {
+        // All LCD drawing happens in this task so nothing races on the SPI bus.
+        if (uiConnectedChanged) {
+            uiConnectedChanged = false;
+            drawStatusBar();
+        }
+        sendControlNotifications();
+
         if (!M5.Mic.record(BUFFER[recIdx ^ 1], READ_SAMPLES, MIC_SAMPLE_RATE)) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
 
-        // Wait until the older request has finished filling BUFFER[recIdx];
-        // isRecording() == 2 means it is still pending behind the newer request.
         while (M5.Mic.isRecording() >= 2) {
+            sendControlNotifications();
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
 
@@ -81,7 +158,6 @@ void mic_record_task(void *arg) {
             drawWaveform();
         }
 
-        // Diagnostic for the current problem: show whether the mic path is alive or stuck at silence.
         int sampleCount = bytesread / 2;
         int nonZeroCount = 0;
         int32_t peak = 0;
@@ -103,9 +179,14 @@ void mic_record_task(void *arg) {
         }
 
         if (packetCounter < 5 || packetCounter % 50 == 0) {
-            M5.Lcd.setCursor(0, 80);
-            M5.Lcd.fillRect(0, 80, 160, 20, BLACK);
+            M5.Lcd.fillRect(0, DIAG_ROW_Y - 1, M5.Lcd.width(), 10, BLACK);
+            M5.Lcd.setCursor(0, DIAG_ROW_Y);
             M5.Lcd.printf("pkt:%lu nz:%d pk:%ld", (unsigned long)packetCounter, nonZeroCount, (long)peak);
+            if (zeroPacketCounter >= 50) {
+                M5.Lcd.setTextColor(RED, BLACK);
+                M5.Lcd.print("  MIC SILENT");
+                M5.Lcd.setTextColor(WHITE, BLACK);
+            }
             Serial.printf("pkt:%lu nz:%d pk:%ld first:%d bytes:%u\n", (unsigned long)packetCounter, nonZeroCount, (long)peak, (int)firstSample, (unsigned int)bytesread);
         }
 
@@ -116,18 +197,16 @@ void mic_record_task(void *arg) {
             if (packetCounter < 5 || packetCounter % 100 == 0) {
                 Serial.printf("notify sent: len=%u\n", (unsigned int)bytesread);
             }
+        } else {
+            rightAltTapPending = false;
+            enterTapPending = false;
         }
 
         packetCounter++;
         recIdx ^= 1;
-
-        if (zeroPacketCounter == 50) {
-            M5.Lcd.setCursor(0, 90);
-            M5.Lcd.fillRect(0, 90, 160, 12, BLACK);
-            M5.Lcd.print("Mic silence/check wiring");
-        }
     }
 }
+
 
 void setup() {
     auto cfg = M5.config();
@@ -171,24 +250,34 @@ void setup() {
     
     BLEDevice::startAdvertising();
 
-    M5.Lcd.println("BLE Ready!\nSearch: M5_BLE_Mic");
+    // Switch from boot messages to the runtime layout: status bar + full-screen waveform.
+    M5.Lcd.fillScreen(BLACK);
+    drawStatusBar();
 
     if (micOk) {
+        micTaskRunning = true;
         xTaskCreatePinnedToCore(mic_record_task, "mic_record_task", 8192, NULL, 1, NULL, 1);
+    } else {
+        M5.Lcd.setCursor(0, DIAG_ROW_Y);
+        M5.Lcd.setTextColor(RED, BLACK);
+        M5.Lcd.print("mic:init fail");
+        M5.Lcd.setTextColor(WHITE, BLACK);
     }
 }
 
 void loop() {
     M5.update(); // 保持核心按键和电源管理状态刷新
-    if (uiConnectedChanged) {
-        uiConnectedChanged = false;
-        M5.Lcd.setCursor(0, 10);
-        M5.Lcd.fillRect(0, 10, 160, 20, BLACK);
-        if (uiIsConnected) {
-            M5.Lcd.println("BLE Connected!");
-        } else {
-            M5.Lcd.println("BLE Disconnected");
-        }
+    if (M5.BtnA.wasHold()) {
+        enterTapPending = deviceConnected;
+        Serial.println(deviceConnected ? "button hold: Enter tap queued" : "button hold ignored: BLE disconnected");
+    } else if (M5.BtnA.wasClicked()) {
+        rightAltTapPending = deviceConnected;
+        Serial.println(deviceConnected ? "button click: Right Alt tap queued" : "button click ignored: BLE disconnected");
     }
-    delay(100);
+    // The mic task owns the LCD; only draw from here if it never started.
+    if (uiConnectedChanged && !micTaskRunning) {
+        uiConnectedChanged = false;
+        drawStatusBar();
+    }
+    delay(10);
 }
